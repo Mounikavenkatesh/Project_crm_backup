@@ -11,7 +11,7 @@ export default function App() {
   const { isAuthenticated } = useAuth();
 
   return (
-    <BrowserRouter>
+    <BrowserRouter basename="/Project_crm">
       <div className="min-h-screen bg-gray-50 text-gray-900 dark:bg-gray-900 dark:text-gray-100 transition-colors duration-200">
         {/* Responsive Sidebar / Mobile Bottom Navbar (Protected only) */}
         {isAuthenticated && <Sidebar />}
