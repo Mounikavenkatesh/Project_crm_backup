@@ -22,3 +22,15 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+.neon
+
+# Local and unrelated files
+/neon.ts
+/68_NASA.pdf
+/Chess_Intelligence_Move_Prediction_Report.pdf
+/Internship_Portal_Report-1.pdf

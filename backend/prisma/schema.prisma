@@ -1,0 +1,255 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DATABASE_URL_UNPOOLED")
+}
+
+enum UserRole {
+  ADMIN
+  MANAGER
+  USER
+}
+
+enum LeadStatus {
+  NEW
+  CONTACTED
+  MEETING_SCHEDULED
+  PROPOSAL_SENT
+  WON
+  LOST
+}
+
+enum LeadSource {
+  WEBSITE
+  REFERRAL
+  LINKEDIN
+  COLD_CALL
+  EMAIL_CAMPAIGN
+  OTHER
+}
+
+enum CustomerStatus {
+  ACTIVE
+  INACTIVE
+  CHURNED
+  VIP
+}
+
+enum TaskStatus {
+  PENDING
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+enum TaskPriority {
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+}
+
+enum ActivityType {
+  LEAD_CREATED
+  LEAD_UPDATED
+  LEAD_STATUS_CHANGED
+  LEAD_CONVERTED
+  CUSTOMER_CREATED
+  CUSTOMER_UPDATED
+  TASK_CREATED
+  TASK_UPDATED
+  TASK_COMPLETED
+  USER_UPDATED
+  SETTINGS_UPDATED
+  LOGIN
+}
+
+enum NotificationType {
+  INFO
+  SUCCESS
+  WARNING
+  ALERT
+}
+
+model User {
+  id          String    @id @default(uuid())
+  name        String
+  email       String    @unique
+  password    String
+  role        UserRole  @default(USER)
+  isActive    Boolean   @default(true)
+  phone       String    @default("")
+  jobTitle    String    @default("")
+  avatarUrl   String    @default("")
+  lastLoginAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  ownedLeads    Lead[]         @relation("LeadOwner")
+  assignedLeads Lead[]         @relation("LeadAssignee")
+  customers     Customer[]     @relation("CustomerOwner")
+  assignedTasks Task[]         @relation("TaskAssignee")
+  createdTasks  Task[]         @relation("TaskCreator")
+  activities    Activity[]
+  notifications Notification[]
+  settings      Settings?
+
+  @@index([email])
+  @@index([role, isActive])
+}
+
+model Lead {
+  id           String     @id @default(uuid())
+  name         String
+  company      String
+  email        String
+  phone        String     @default("")
+  status       LeadStatus @default(NEW)
+  source       LeadSource @default(WEBSITE)
+  value        Float      @default(0)
+  notes        String     @default("")
+  contactedAt  DateTime?
+  meetingAt    DateTime?
+  proposalAt   DateTime?
+  wonAt        DateTime?
+  lostAt       DateTime?
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+
+  ownerId      String
+  owner        User       @relation("LeadOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+
+  assignedToId String?
+  assignedTo   User?      @relation("LeadAssignee", fields: [assignedToId], references: [id], onDelete: SetNull)
+
+  convertedCustomer Customer?
+  tasks             Task[]
+  activities        Activity[]
+
+  @@index([ownerId, status])
+  @@index([assignedToId])
+  @@index([email])
+  @@index([createdAt])
+}
+
+model Customer {
+  id           String         @id @default(uuid())
+  name         String
+  company      String
+  email        String
+  phone        String         @default("")
+  industry     String         @default("")
+  website      String         @default("")
+  address      String         @default("")
+  status       CustomerStatus @default(ACTIVE)
+  totalRevenue Float          @default(0)
+  notes        String         @default("")
+  createdAt    DateTime       @default(now())
+  updatedAt    DateTime       @updatedAt
+
+  ownerId      String
+  owner        User           @relation("CustomerOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+
+  sourceLeadId String?        @unique
+  sourceLead   Lead?          @relation(fields: [sourceLeadId], references: [id], onDelete: SetNull)
+
+  tasks        Task[]
+  activities   Activity[]
+
+  @@index([ownerId, status])
+  @@index([email])
+  @@index([createdAt])
+}
+
+model Task {
+  id          String       @id @default(uuid())
+  title       String
+  description String       @default("")
+  status      TaskStatus   @default(PENDING)
+  priority    TaskPriority @default(MEDIUM)
+  dueDate     DateTime?
+  completedAt DateTime?
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  assignedToId String
+  assignedTo   User        @relation("TaskAssignee", fields: [assignedToId], references: [id], onDelete: Cascade)
+
+  createdById  String
+  createdBy    User        @relation("TaskCreator", fields: [createdById], references: [id], onDelete: Cascade)
+
+  leadId       String?
+  lead         Lead?       @relation(fields: [leadId], references: [id], onDelete: SetNull)
+
+  customerId   String?
+  customer     Customer?   @relation(fields: [customerId], references: [id], onDelete: SetNull)
+
+  activities   Activity[]
+
+  @@index([assignedToId, status])
+  @@index([createdById])
+  @@index([dueDate])
+  @@index([leadId])
+  @@index([customerId])
+}
+
+model Activity {
+  id          String       @id @default(uuid())
+  type        ActivityType
+  title       String
+  description String       @default("")
+  metadata    Json?
+  createdAt   DateTime     @default(now())
+
+  userId      String
+  user        User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  leadId      String?
+  lead        Lead?        @relation(fields: [leadId], references: [id], onDelete: SetNull)
+
+  customerId  String?
+  customer    Customer?    @relation(fields: [customerId], references: [id], onDelete: SetNull)
+
+  taskId      String?
+  task        Task?        @relation(fields: [taskId], references: [id], onDelete: SetNull)
+
+  @@index([userId, createdAt])
+  @@index([leadId])
+  @@index([customerId])
+  @@index([createdAt])
+}
+
+model Notification {
+  id        String           @id @default(uuid())
+  title     String
+  message   String
+  type      NotificationType @default(INFO)
+  isRead    Boolean          @default(false)
+  link      String?
+  createdAt DateTime         @default(now())
+
+  userId    String
+  user      User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, isRead, createdAt])
+}
+
+model Settings {
+  id                 String   @id @default(uuid())
+  companyName        String   @default("Startup CRM")
+  currency           String   @default("INR")
+  timezone           String   @default("Asia/Kolkata")
+  theme              String   @default("system")
+  emailNotifications Boolean  @default(true)
+  taskReminders      Boolean  @default(true)
+  leadAlerts         Boolean  @default(true)
+  weeklyDigest       Boolean  @default(false)
+  updatedAt          DateTime @updatedAt
+
+  userId             String   @unique
+  user               User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
