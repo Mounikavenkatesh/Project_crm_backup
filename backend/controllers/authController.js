@@ -1,6 +1,9 @@
+import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
-import User from '../models/User.js';
+import prisma from '../config/database.js';
 import { successResponse, errorResponse } from '../utils/apiResponse.js';
+import { formatUser } from '../utils/crmEnums.js';
+import { logActivity } from '../utils/activityLogger.js';
 
 /**
  * Generate a JWT token for the user.
@@ -20,25 +23,38 @@ const generateToken = (userId) => {
  */
 export const register = async (req, res, next) => {
   try {
-    const { name, email, password } = req.body;
+    const name = String(req.body.name || '').trim();
+    const email = String(req.body.email || '').trim().toLowerCase();
+    const { password } = req.body;
 
-    // Check if user already exists
-    const userExists = await User.findOne({ email });
+    const userExists = await prisma.user.findUnique({ where: { email } });
     if (userExists) {
       return errorResponse(res, 'Email is already registered', 400);
     }
 
-    // Create new user
-    const user = await User.create({
-      name,
-      email,
-      password,
+    const salt = await bcrypt.genSalt(10);
+    const hashedPassword = await bcrypt.hash(password, salt);
+
+    const user = await prisma.user.create({
+      data: {
+        name,
+        email,
+        password: hashedPassword,
+        role: 'USER',
+        settings: {
+          create: {},
+        },
+      },
     });
 
-    const token = generateToken(user._id);
+    const token = generateToken(user.id);
+    const userObj = formatUser(user);
 
-    // Remove password before returning
-    const userObj = user.toJSON();
+    await logActivity({
+      userId: user.id,
+      type: 'LOGIN',
+      title: `${user.name} registered and signed in`,
+    });
 
     return successResponse(
       res,
@@ -58,28 +74,36 @@ export const register = async (req, res, next) => {
  */
 export const login = async (req, res, next) => {
   try {
-    const { email, password } = req.body;
+    const email = String(req.body.email || '').trim().toLowerCase();
+    const { password } = req.body;
 
-    // Find user and explicitly select password
-    const user = await User.findOne({ email }).select('+password');
+    const user = await prisma.user.findUnique({ where: { email } });
     if (!user) {
-      // 401 Unauthorized for security (never reveal whether email or password is wrong)
       return errorResponse(res, 'Invalid credentials', 401);
     }
 
-    // Check password
-    const isMatch = await user.comparePassword(password);
+    const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) {
       return errorResponse(res, 'Invalid credentials', 401);
     }
 
-    // Check if user is active
     if (!user.isActive) {
       return errorResponse(res, 'Account is deactivated', 403);
     }
 
-    const token = generateToken(user._id);
-    const userObj = user.toJSON();
+    const updatedUser = await prisma.user.update({
+      where: { id: user.id },
+      data: { lastLoginAt: new Date() },
+    });
+
+    const token = generateToken(updatedUser.id);
+    const userObj = formatUser(updatedUser);
+
+    await logActivity({
+      userId: updatedUser.id,
+      type: 'LOGIN',
+      title: `${updatedUser.name} signed in`,
+    });
 
     return successResponse(
       res,
@@ -99,7 +123,6 @@ export const login = async (req, res, next) => {
  */
 export const getProfile = async (req, res, next) => {
   try {
-    // req.user is already set by protect middleware
     return successResponse(res, req.user, 'Profile retrieved successfully');
   } catch (error) {
     next(error);
@@ -108,25 +131,35 @@ export const getProfile = async (req, res, next) => {
 
 /**
  * Update user profile.
- * Allows updating name, and if new password is provided, verifies old password first.
+ * Allows updating name (and optional phone/jobTitle/avatarUrl), and if new password is provided,
+ * verifies old password first.
  * @route PUT /api/auth/profile
  * @access Private
  */
 export const updateProfile = async (req, res, next) => {
   try {
-    const { name, oldPassword, newPassword } = req.body;
-    const user = await User.findById(req.user._id).select('+password');
+    const { name, phone, jobTitle, avatarUrl, oldPassword, newPassword } = req.body;
+    const user = await prisma.user.findUnique({ where: { id: req.user.id } });
 
     if (!user) {
       return errorResponse(res, 'User not found', 404);
     }
 
-    // Update name if provided
-    if (name) {
-      user.name = name;
+    const updateData = {};
+
+    if (name !== undefined && String(name).trim()) {
+      updateData.name = String(name).trim();
+    }
+    if (phone !== undefined) {
+      updateData.phone = String(phone).trim();
+    }
+    if (jobTitle !== undefined) {
+      updateData.jobTitle = String(jobTitle).trim();
+    }
+    if (avatarUrl !== undefined) {
+      updateData.avatarUrl = String(avatarUrl).trim();
     }
 
-    // Update password if newPassword is provided
     if (newPassword) {
       if (!oldPassword) {
         return errorResponse(
@@ -136,20 +169,25 @@ export const updateProfile = async (req, res, next) => {
         );
       }
 
-      const isMatch = await user.comparePassword(oldPassword);
+      const isMatch = await bcrypt.compare(oldPassword, user.password);
       if (!isMatch) {
         return errorResponse(res, 'Incorrect old password', 400);
       }
 
-      user.password = newPassword;
+      const salt = await bcrypt.genSalt(10);
+      updateData.password = await bcrypt.hash(newPassword, salt);
     }
 
-    await user.save();
+    const updatedUser = await prisma.user.update({
+      where: { id: user.id },
+      data: updateData,
+    });
 
-    // Convert to JSON to strip password
-    const updatedUserObj = user.toJSON();
-
-    return successResponse(res, updatedUserObj, 'Profile updated successfully');
+    return successResponse(
+      res,
+      formatUser(updatedUser),
+      'Profile updated successfully'
+    );
   } catch (error) {
     next(error);
   }

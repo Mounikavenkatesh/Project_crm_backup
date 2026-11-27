@@ -1,11 +1,21 @@
-import Lead from '../models/Lead.js';
+import prisma from '../config/database.js';
 import { successResponse, errorResponse, paginatedResponse } from '../utils/apiResponse.js';
+import {
+  LEAD_STATUS_TO_PRISMA,
+  LEAD_STATUS_FROM_PRISMA,
+  LEAD_SOURCE_TO_PRISMA,
+  LEAD_SOURCE_FROM_PRISMA,
+  formatLead,
+} from '../utils/crmEnums.js';
+import { logActivity } from '../utils/activityLogger.js';
 
-/**
- * Helper to log operations in development mode.
- * @param {string} operation Name of the operation.
- * @param {object} details Log details.
- */
+const ALLOWED_SORT_FIELDS = ['createdAt', 'updatedAt', 'name', 'company', 'value', 'status'];
+
+const leadInclude = {
+  owner: { select: { id: true, name: true, email: true } },
+  assignedTo: { select: { id: true, name: true, email: true } },
+};
+
 const devLog = (operation, details) => {
   if (process.env.NODE_ENV === 'development') {
     console.log(`[LeadController] ${operation} - ${JSON.stringify(details)}`);
@@ -13,38 +23,55 @@ const devLog = (operation, details) => {
 };
 
 /**
- * Helper to update status-related timestamps.
- * @param {object} lead The lead document.
- * @param {string} status The new status.
+ * Scope leads by role while preserving strict ownership isolation for standard users.
  */
-const updateStatusTimestamps = (lead, status) => {
-  const now = new Date();
-  if (status === 'Contacted') {
-    lead.contactedAt = lead.contactedAt || now;
-  } else if (status === 'Meeting Scheduled') {
-    lead.contactedAt = lead.contactedAt || now;
-    lead.meetingAt = lead.meetingAt || now;
-  } else if (status === 'Proposal Sent') {
-    lead.contactedAt = lead.contactedAt || now;
-    lead.meetingAt = lead.meetingAt || now;
-    lead.proposalAt = lead.proposalAt || now;
-  } else if (status === 'Won') {
-    lead.contactedAt = lead.contactedAt || now;
-    lead.meetingAt = lead.meetingAt || now;
-    lead.proposalAt = lead.proposalAt || now;
-    lead.wonAt = lead.wonAt || now;
+const buildLeadScope = (user) => {
+  if (user.role === 'admin' || user.role === 'manager') {
+    return {};
   }
+  return {
+    OR: [{ ownerId: user.id }, { assignedToId: user.id }],
+  };
+};
+
+/**
+ * Compute status progression timestamps without overwriting earlier stage timestamps.
+ */
+const buildStatusTimestamps = (existingLead, nextPrismaStatus) => {
+  const now = new Date();
+  const timestamps = {};
+
+  const currentContacted = existingLead?.contactedAt || null;
+  const currentMeeting = existingLead?.meetingAt || null;
+  const currentProposal = existingLead?.proposalAt || null;
+  const currentWon = existingLead?.wonAt || null;
+  const currentLost = existingLead?.lostAt || null;
+
+  if (nextPrismaStatus === 'CONTACTED') {
+    timestamps.contactedAt = currentContacted || now;
+  } else if (nextPrismaStatus === 'MEETING_SCHEDULED') {
+    timestamps.contactedAt = currentContacted || now;
+    timestamps.meetingAt = currentMeeting || now;
+  } else if (nextPrismaStatus === 'PROPOSAL_SENT') {
+    timestamps.contactedAt = currentContacted || now;
+    timestamps.meetingAt = currentMeeting || now;
+    timestamps.proposalAt = currentProposal || now;
+  } else if (nextPrismaStatus === 'WON') {
+    timestamps.contactedAt = currentContacted || now;
+    timestamps.meetingAt = currentMeeting || now;
+    timestamps.proposalAt = currentProposal || now;
+    timestamps.wonAt = currentWon || now;
+  } else if (nextPrismaStatus === 'LOST') {
+    timestamps.lostAt = currentLost || now;
+  }
+
+  return timestamps;
 };
 
 /**
  * Get all leads for the logged-in user with filtering, search, sorting, and pagination.
- * 
  * @route GET /api/leads
  * @access Private
- * @param {object} req Express request object.
- * @param {object} req.query Query parameters: { status, search, source, page, limit, sortBy, sortOrder, dateFrom, dateTo }
- * @param {object} res Express response object.
- * @param {function} next Express next middleware callback.
  */
 export const getLeads = async (req, res, next) => {
   try {
@@ -60,61 +87,72 @@ export const getLeads = async (req, res, next) => {
       dateTo,
     } = req.query;
 
-    const pageNum = parseInt(page, 10) || 1;
-    const limitNum = parseInt(limit, 10) || 20;
+    const pageNum = Math.max(1, parseInt(page, 10) || 1);
+    const limitNum = Math.min(100, Math.max(1, parseInt(limit, 10) || 20));
     const skipNum = (pageNum - 1) * limitNum;
 
-    // Build filter with owner isolation
-    const filter = { owner: req.user._id };
-
-    // Status filter
-    if (status && status !== 'All') {
-      filter.status = status;
+    const andConditions = [];
+    const scope = buildLeadScope(req.user);
+    if (Object.keys(scope).length > 0) {
+      andConditions.push(scope);
     }
 
-    // Source filter
-    if (source && source !== 'All') {
-      filter.source = source;
+    if (status && status !== 'All' && LEAD_STATUS_TO_PRISMA[status]) {
+      andConditions.push({ status: LEAD_STATUS_TO_PRISMA[status] });
     }
 
-    // Search filter (name, company, email)
-    if (search) {
-      filter.$or = [
-        { name: { $regex: search, $options: 'i' } },
-        { company: { $regex: search, $options: 'i' } },
-        { email: { $regex: search, $options: 'i' } },
-      ];
+    if (source && source !== 'All' && LEAD_SOURCE_TO_PRISMA[source]) {
+      andConditions.push({ source: LEAD_SOURCE_TO_PRISMA[source] });
     }
 
-    // Date filters (createdAt)
+    if (search && search.trim()) {
+      const term = search.trim();
+      andConditions.push({
+        OR: [
+          { name: { contains: term, mode: 'insensitive' } },
+          { company: { contains: term, mode: 'insensitive' } },
+          { email: { contains: term, mode: 'insensitive' } },
+        ],
+      });
+    }
+
     if (dateFrom || dateTo) {
-      filter.createdAt = {};
+      const createdAt = {};
       if (dateFrom) {
-        filter.createdAt.$gte = new Date(dateFrom);
+        createdAt.gte = new Date(dateFrom);
       }
       if (dateTo) {
-        // Set dateTo to the end of the day (23:59:59.999)
         const dateToObj = new Date(dateTo);
         dateToObj.setHours(23, 59, 59, 999);
-        filter.createdAt.$lte = dateToObj;
+        createdAt.lte = dateToObj;
       }
+      andConditions.push({ createdAt });
     }
 
-    devLog('getLeads Filter', filter);
+    const where = andConditions.length > 0 ? { AND: andConditions } : {};
+    const safeSortBy = ALLOWED_SORT_FIELDS.includes(sortBy) ? sortBy : 'createdAt';
+    const safeSortOrder = sortOrder === 'asc' ? 'asc' : 'desc';
 
-    // Run query with sorting, pagination
-    const sortField = sortBy;
-    const sortDir = sortOrder === 'desc' ? -1 : 1;
+    devLog('getLeads Filter', where);
 
     const [leads, total] = await Promise.all([
-      Lead.find(filter)
-        .sort({ [sortField]: sortDir })
-        .skip(skipNum)
-        .limit(limitNum),
-      Lead.countDocuments(filter),
+      prisma.lead.findMany({
+        where,
+        include: leadInclude,
+        orderBy: { [safeSortBy]: safeSortOrder },
+        skip: skipNum,
+        take: limitNum,
+      }),
+      prisma.lead.count({ where }),
     ]);
 
-    return paginatedResponse(res, leads, total, pageNum, limitNum);
+    return paginatedResponse(
+      res,
+      leads.map(formatLead),
+      total,
+      pageNum,
+      limitNum
+    );
   } catch (error) {
     next(error);
   }
@@ -122,115 +160,169 @@ export const getLeads = async (req, res, next) => {
 
 /**
  * Create a new lead.
- * 
  * @route POST /api/leads
  * @access Private
- * @param {object} req Express request object with lead fields in body.
- * @param {object} res Express response object.
- * @param {function} next Express next middleware callback.
  */
 export const createLead = async (req, res, next) => {
   try {
     devLog('createLead Body', req.body);
 
-    const leadData = {
-      ...req.body,
-      owner: req.user._id,
-    };
+    const {
+      name,
+      company,
+      email,
+      phone = '',
+      status = 'New',
+      source = 'Website',
+      value = 0,
+      notes = '',
+      assignedToId = null,
+    } = req.body;
 
-    const lead = new Lead(leadData);
+    const prismaStatus = LEAD_STATUS_TO_PRISMA[status] || 'NEW';
+    const prismaSource = LEAD_SOURCE_TO_PRISMA[source] || 'WEBSITE';
+    const targetAssigneeId = assignedToId || req.user.id;
 
-    // Automatically set timestamps if status is already set to something other than 'New'
-    if (lead.status && lead.status !== 'New') {
-      updateStatusTimestamps(lead, lead.status);
-    }
+    const lead = await prisma.lead.create({
+      data: {
+        name: String(name).trim(),
+        company: String(company).trim(),
+        email: String(email).trim(),
+        phone: String(phone || '').trim(),
+        status: prismaStatus,
+        source: prismaSource,
+        value: Number(value) || 0,
+        notes: String(notes || ''),
+        ownerId: req.user.id,
+        assignedToId: targetAssigneeId,
+        ...buildStatusTimestamps(null, prismaStatus),
+      },
+      include: leadInclude,
+    });
 
-    await lead.save();
+    await logActivity({
+      userId: req.user.id,
+      type: 'LEAD_CREATED',
+      title: `${req.user.name} created lead "${lead.name}" (${lead.company})`,
+      leadId: lead.id,
+    });
 
-    devLog('createLead Success', { id: lead._id });
-    return successResponse(res, lead, 'Lead created successfully', 201);
+    devLog('createLead Success', { id: lead.id });
+    return successResponse(res, formatLead(lead), 'Lead created successfully', 201);
   } catch (error) {
     next(error);
   }
 };
 
 /**
- * Get a specific lead by ID.
- * Checks for owner isolation.
- * 
+ * Get a specific lead by ID with owner isolation.
  * @route GET /api/leads/:id
  * @access Private
- * @param {object} req Express request object with ID parameter.
- * @param {object} res Express response object.
- * @param {function} next Express next middleware callback.
  */
 export const getLeadById = async (req, res, next) => {
   try {
     const { id } = req.params;
     devLog('getLeadById', { id });
 
-    const lead = await Lead.findOne({ _id: id, owner: req.user._id });
+    const lead = await prisma.lead.findFirst({
+      where: {
+        id,
+        ...buildLeadScope(req.user),
+      },
+      include: leadInclude,
+    });
+
     if (!lead) {
       return errorResponse(res, 'Lead not found', 404);
     }
 
-    return successResponse(res, lead, 'Lead retrieved successfully');
+    return successResponse(res, formatLead(lead), 'Lead retrieved successfully');
   } catch (error) {
     next(error);
   }
 };
 
 /**
- * Update a lead completely.
- * Checks for owner isolation.
- * 
+ * Update a lead completely with owner isolation.
  * @route PUT /api/leads/:id
  * @access Private
- * @param {object} req Express request object with ID parameter and update fields.
- * @param {object} res Express response object.
- * @param {function} next Express next middleware callback.
  */
 export const updateLead = async (req, res, next) => {
   try {
     const { id } = req.params;
     devLog('updateLead', { id, body: req.body });
 
-    const lead = await Lead.findOne({ _id: id, owner: req.user._id });
-    if (!lead) {
+    const existing = await prisma.lead.findFirst({
+      where: {
+        id,
+        ...buildLeadScope(req.user),
+      },
+    });
+
+    if (!existing) {
       return errorResponse(res, 'Lead not found', 404);
     }
 
-    // Do NOT allow changing the owner
-    const updateData = { ...req.body };
-    delete updateData.owner;
+    const {
+      name,
+      company,
+      email,
+      phone,
+      status,
+      source,
+      value,
+      notes,
+      assignedToId,
+    } = req.body;
 
-    // Update fields manually to allow validators to run and apply status timestamps
-    Object.keys(updateData).forEach((key) => {
-      // If status changed, apply timestamps
-      if (key === 'status' && updateData.status !== lead.status) {
-        updateStatusTimestamps(lead, updateData.status);
+    const updateData = {};
+    if (name !== undefined) updateData.name = String(name).trim();
+    if (company !== undefined) updateData.company = String(company).trim();
+    if (email !== undefined) updateData.email = String(email).trim();
+    if (phone !== undefined) updateData.phone = String(phone || '').trim();
+    if (notes !== undefined) updateData.notes = String(notes || '');
+    if (value !== undefined) updateData.value = Number(value) || 0;
+    if (assignedToId !== undefined) updateData.assignedToId = assignedToId || existing.ownerId;
+
+    if (source !== undefined && LEAD_SOURCE_TO_PRISMA[source]) {
+      updateData.source = LEAD_SOURCE_TO_PRISMA[source];
+    }
+
+    if (status !== undefined && LEAD_STATUS_TO_PRISMA[status]) {
+      const nextStatus = LEAD_STATUS_TO_PRISMA[status];
+      updateData.status = nextStatus;
+      if (nextStatus !== existing.status) {
+        Object.assign(updateData, buildStatusTimestamps(existing, nextStatus));
       }
-      lead[key] = updateData[key];
+    }
+
+    const updated = await prisma.lead.update({
+      where: { id: existing.id },
+      data: updateData,
+      include: leadInclude,
     });
 
-    await lead.save({ runValidators: true });
+    await logActivity({
+      userId: req.user.id,
+      type:
+        updateData.status && updateData.status !== existing.status
+          ? 'LEAD_STATUS_CHANGED'
+          : 'LEAD_UPDATED',
+      title: `${req.user.name} updated lead "${updated.name}"`,
+      leadId: updated.id,
+    });
 
-    devLog('updateLead Success', { id: lead._id });
-    return successResponse(res, lead, 'Lead updated successfully');
+    devLog('updateLead Success', { id: updated.id });
+    return successResponse(res, formatLead(updated), 'Lead updated successfully');
   } catch (error) {
     next(error);
   }
 };
 
 /**
- * Update only the status field of a lead.
- * Checks for owner isolation.
- * 
+ * Update only the status field of a lead with owner isolation.
  * @route PATCH /api/leads/:id/status
  * @access Private
- * @param {object} req Express request object with ID parameter and status in body.
- * @param {object} res Express response object.
- * @param {function} next Express next middleware callback.
  */
 export const updateLeadStatus = async (req, res, next) => {
   try {
@@ -238,8 +330,14 @@ export const updateLeadStatus = async (req, res, next) => {
     const { status } = req.body;
     devLog('updateLeadStatus', { id, status });
 
-    const lead = await Lead.findOne({ _id: id, owner: req.user._id });
-    if (!lead) {
+    const existing = await prisma.lead.findFirst({
+      where: {
+        id,
+        ...buildLeadScope(req.user),
+      },
+    });
+
+    if (!existing) {
       return errorResponse(res, 'Lead not found', 404);
     }
 
@@ -247,42 +345,60 @@ export const updateLeadStatus = async (req, res, next) => {
       return errorResponse(res, 'Status is required', 400);
     }
 
-    // Apply timestamps if status is changing
-    if (status !== lead.status) {
-      updateStatusTimestamps(lead, status);
-      lead.status = status;
+    const nextPrismaStatus = LEAD_STATUS_TO_PRISMA[status];
+    if (!nextPrismaStatus) {
+      return errorResponse(res, 'Invalid status value', 400);
     }
 
-    await lead.save({ runValidators: true });
+    const updateData = {
+      status: nextPrismaStatus,
+      ...(nextPrismaStatus !== existing.status
+        ? buildStatusTimestamps(existing, nextPrismaStatus)
+        : {}),
+    };
 
-    devLog('updateLeadStatus Success', { id: lead._id, status: lead.status });
-    return successResponse(res, lead, 'Lead status updated successfully');
+    const updated = await prisma.lead.update({
+      where: { id: existing.id },
+      data: updateData,
+      include: leadInclude,
+    });
+
+    await logActivity({
+      userId: req.user.id,
+      type: 'LEAD_STATUS_CHANGED',
+      title: `${req.user.name} moved "${updated.name}" to ${LEAD_STATUS_FROM_PRISMA[nextPrismaStatus] || nextPrismaStatus}`,
+      leadId: updated.id,
+    });
+
+    devLog('updateLeadStatus Success', { id: updated.id, status: updated.status });
+    return successResponse(res, formatLead(updated), 'Lead status updated successfully');
   } catch (error) {
     next(error);
   }
 };
 
 /**
- * Delete a lead permanently.
- * Checks for owner isolation.
- * 
+ * Delete a lead permanently with owner isolation.
  * @route DELETE /api/leads/:id
  * @access Private
- * @param {object} req Express request object with ID parameter.
- * @param {object} res Express response object.
- * @param {function} next Express next middleware callback.
  */
 export const deleteLead = async (req, res, next) => {
   try {
     const { id } = req.params;
     devLog('deleteLead', { id });
 
-    const lead = await Lead.findOne({ _id: id, owner: req.user._id });
-    if (!lead) {
+    const existing = await prisma.lead.findFirst({
+      where: {
+        id,
+        ...buildLeadScope(req.user),
+      },
+    });
+
+    if (!existing) {
       return errorResponse(res, 'Lead not found', 404);
     }
 
-    await lead.deleteOne();
+    await prisma.lead.delete({ where: { id: existing.id } });
 
     devLog('deleteLead Success', { id });
     return successResponse(res, null, 'Lead deleted successfully');
@@ -292,60 +408,49 @@ export const deleteLead = async (req, res, next) => {
 };
 
 /**
- * Get leads analytics statistics for the dashboard dashboard widgets.
- * Computes status breakdowns, sources breakdowns, monthly comparisons in a single database query.
- * 
+ * Get leads analytics statistics for dashboard widgets.
  * @route GET /api/leads/stats/summary
  * @access Private
- * @param {object} req Express request object.
- * @param {object} res Express response object.
- * @param {function} next Express next middleware callback.
  */
 export const getLeadStats = async (req, res, next) => {
   try {
-    devLog('getLeadStats', { userId: req.user._id });
+    devLog('getLeadStats', { userId: req.user.id });
 
-    // Calculate dates for current month and last month
     const now = new Date();
     const startOfCurrentMonth = new Date(now.getFullYear(), now.getMonth(), 1);
     const startOfLastMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+    const scope = buildLeadScope(req.user);
 
-    const stats = await Lead.aggregate([
-      // Match by owner
-      { $match: { owner: req.user._id } },
-      // Multi-facet aggregation to get breakdowns in one single database call
-      {
-        $facet: {
-          totalCount: [{ $count: 'count' }],
-          statusGroups: [
-            { $group: { _id: '$status', count: { $sum: 1 } } },
-          ],
-          sourceGroups: [
-            { $group: { _id: '$source', count: { $sum: 1 } } },
-          ],
-          thisMonthCount: [
-            { $match: { createdAt: { $gte: startOfCurrentMonth } } },
-            { $count: 'count' },
-          ],
-          lastMonthCount: [
-            {
-              $match: {
-                createdAt: {
-                  $gte: startOfLastMonth,
-                  $lt: startOfCurrentMonth,
-                },
-              },
+    const [totalLeads, statusGroups, sourceGroups, thisMonthLeads, lastMonthLeads] =
+      await Promise.all([
+        prisma.lead.count({ where: scope }),
+        prisma.lead.groupBy({
+          by: ['status'],
+          where: scope,
+          _count: { _all: true },
+        }),
+        prisma.lead.groupBy({
+          by: ['source'],
+          where: scope,
+          _count: { _all: true },
+        }),
+        prisma.lead.count({
+          where: {
+            ...scope,
+            createdAt: { gte: startOfCurrentMonth },
+          },
+        }),
+        prisma.lead.count({
+          where: {
+            ...scope,
+            createdAt: {
+              gte: startOfLastMonth,
+              lt: startOfCurrentMonth,
             },
-            { $count: 'count' },
-          ],
-        },
-      },
-    ]);
+          },
+        }),
+      ]);
 
-    const result = stats[0] || {};
-    const totalLeads = result.totalCount?.[0]?.count || 0;
-
-    // Status breakdown formatting
     const statusBreakdown = {
       New: 0,
       Contacted: 0,
@@ -354,15 +459,13 @@ export const getLeadStats = async (req, res, next) => {
       Won: 0,
       Lost: 0,
     };
-    if (result.statusGroups) {
-      result.statusGroups.forEach((group) => {
-        if (statusBreakdown[group._id] !== undefined) {
-          statusBreakdown[group._id] = group.count;
-        }
-      });
-    }
+    statusGroups.forEach((group) => {
+      const label = LEAD_STATUS_FROM_PRISMA[group.status];
+      if (label && statusBreakdown[label] !== undefined) {
+        statusBreakdown[label] = group._count._all;
+      }
+    });
 
-    // Source breakdown formatting
     const sourceBreakdown = {
       Website: 0,
       Referral: 0,
@@ -371,25 +474,22 @@ export const getLeadStats = async (req, res, next) => {
       'Email Campaign': 0,
       Other: 0,
     };
-    if (result.sourceGroups) {
-      result.sourceGroups.forEach((group) => {
-        if (sourceBreakdown[group._id] !== undefined) {
-          sourceBreakdown[group._id] = group.count;
-        }
-      });
-    }
+    sourceGroups.forEach((group) => {
+      const label = LEAD_SOURCE_FROM_PRISMA[group.source];
+      if (label && sourceBreakdown[label] !== undefined) {
+        sourceBreakdown[label] = group._count._all;
+      }
+    });
 
-    const thisMonthLeads = result.thisMonthCount?.[0]?.count || 0;
-    const lastMonthLeads = result.lastMonthCount?.[0]?.count || 0;
+    const conversionRate =
+      totalLeads > 0
+        ? Math.round(((statusBreakdown.Won || 0) / totalLeads) * 100 * 10) / 10
+        : 0;
 
-    // Division by zero safe calculations
-    const conversionRate = totalLeads > 0
-      ? Math.round(((statusBreakdown.Won || 0) / totalLeads) * 100 * 10) / 10
-      : 0;
-
-    const growthRate = lastMonthLeads === 0
-      ? thisMonthLeads * 100
-      : Math.round(((thisMonthLeads - lastMonthLeads) / lastMonthLeads) * 100 * 10) / 10;
+    const growthRate =
+      lastMonthLeads === 0
+        ? thisMonthLeads * 100
+        : Math.round(((thisMonthLeads - lastMonthLeads) / lastMonthLeads) * 100 * 10) / 10;
 
     const analyticsStats = {
       totalLeads,
@@ -412,22 +512,16 @@ export const getLeadStats = async (req, res, next) => {
 
 /**
  * Get monthly lead and conversion rates for the past 6 calendar months.
- * Handled chronologically and handles zero-leads months gracefully.
- * 
  * @route GET /api/leads/stats/monthly
  * @access Private
- * @param {object} req Express request object.
- * @param {object} res Express response object.
- * @param {function} next Express next middleware callback.
  */
 export const getMonthlyStats = async (req, res, next) => {
   try {
-    devLog('getMonthlyStats', { userId: req.user._id });
+    devLog('getMonthlyStats', { userId: req.user.id });
 
     const monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
     const monthsList = [];
 
-    // Pre-calculate last 6 months label array chronologically
     for (let i = 5; i >= 0; i--) {
       const d = new Date();
       d.setMonth(d.getMonth() - i);
@@ -436,7 +530,7 @@ export const getMonthlyStats = async (req, res, next) => {
       monthsList.push({
         month: `${mName} ${year}`,
         year,
-        monthNum: d.getMonth() + 1, // 1-indexed for MongoDB
+        monthNum: d.getMonth(),
         total: 0,
         won: 0,
         lost: 0,
@@ -444,54 +538,40 @@ export const getMonthlyStats = async (req, res, next) => {
       });
     }
 
-    // Fetch matching data from MongoDB aggregation
     const startOf6MonthsAgo = new Date();
     startOf6MonthsAgo.setMonth(startOf6MonthsAgo.getMonth() - 5);
     startOf6MonthsAgo.setDate(1);
     startOf6MonthsAgo.setHours(0, 0, 0, 0);
 
-    const results = await Lead.aggregate([
-      {
-        $match: {
-          owner: req.user._id,
-          createdAt: { $gte: startOf6MonthsAgo },
-        },
+    const leads = await prisma.lead.findMany({
+      where: {
+        ...buildLeadScope(req.user),
+        createdAt: { gte: startOf6MonthsAgo },
       },
-      {
-        $group: {
-          _id: {
-            year: { $year: '$createdAt' },
-            month: { $month: '$createdAt' },
-          },
-          total: { $sum: 1 },
-          won: { $sum: { $cond: [{ $eq: ['$status', 'Won'] }, 1, 0] } },
-          lost: { $sum: { $cond: [{ $eq: ['$status', 'Lost'] }, 1, 0] } },
-        },
+      select: {
+        createdAt: true,
+        status: true,
       },
-    ]);
+    });
 
-    // Map DB results to correct pre-generated slots
-    results.forEach((dbRow) => {
+    leads.forEach((lead) => {
+      const created = new Date(lead.createdAt);
       const target = monthsList.find(
-        (m) => m.year === dbRow._id.year && m.monthNum === dbRow._id.month
+        (m) => m.year === created.getFullYear() && m.monthNum === created.getMonth()
       );
       if (target) {
-        target.total = dbRow.total;
-        target.won = dbRow.won;
-        target.lost = dbRow.lost;
-        target.conversionRate = dbRow.total > 0
-          ? Math.round((dbRow.won / dbRow.total) * 100 * 10) / 10
-          : 0;
+        target.total += 1;
+        if (lead.status === 'WON') target.won += 1;
+        if (lead.status === 'LOST') target.lost += 1;
       }
     });
 
-    // Clean structure to match frontend expectations (remove year and monthNum helper keys)
-    const finalStats = monthsList.map(({ month, total, won, lost, conversionRate }) => ({
+    const finalStats = monthsList.map(({ month, total, won, lost }) => ({
       month,
       total,
       won,
       lost,
-      conversionRate,
+      conversionRate: total > 0 ? Math.round((won / total) * 100 * 10) / 10 : 0,
     }));
 
     devLog('getMonthlyStats Success', finalStats);
@@ -502,41 +582,48 @@ export const getMonthlyStats = async (req, res, next) => {
 };
 
 /**
- * Autocomplete/Autocomplete Search endpoint.
- * Returns a maximum of 5 leads matching the search query with select properties.
- * 
+ * Autocomplete search endpoint returning up to 5 leads matching query string.
  * @route GET /api/leads/search
  * @access Private
- * @param {object} req Express request object with 'q' in query.
- * @param {object} res Express response object.
- * @param {function} next Express next middleware callback.
  */
 export const searchLeads = async (req, res, next) => {
   try {
     const { q, limit = 5 } = req.query;
     devLog('searchLeads', { q, limit });
 
-    if (!q) {
+    if (!q || !String(q).trim()) {
       return successResponse(res, [], 'Search query empty');
     }
 
-    const limitNum = parseInt(limit, 10) || 5;
+    const limitNum = Math.min(20, Math.max(1, parseInt(limit, 10) || 5));
+    const term = String(q).trim();
 
-    // Search inside name, company, email with case-insensitivity
-    const filter = {
-      owner: req.user._id,
-      $or: [
-        { name: { $regex: q, $options: 'i' } },
-        { company: { $regex: q, $options: 'i' } },
-        { email: { $regex: q, $options: 'i' } },
-      ],
-    };
+    const results = await prisma.lead.findMany({
+      where: {
+        ...buildLeadScope(req.user),
+        OR: [
+          { name: { contains: term, mode: 'insensitive' } },
+          { company: { contains: term, mode: 'insensitive' } },
+          { email: { contains: term, mode: 'insensitive' } },
+        ],
+      },
+      select: {
+        id: true,
+        name: true,
+        company: true,
+        email: true,
+        status: true,
+      },
+      take: limitNum,
+      orderBy: { createdAt: 'desc' },
+    });
 
-    const results = await Lead.find(filter)
-      .select('_id name company email status')
-      .limit(limitNum);
+    const formatted = results.map((lead) => ({
+      ...lead,
+      status: LEAD_STATUS_FROM_PRISMA[lead.status] || lead.status,
+    }));
 
-    return successResponse(res, results, 'Quick search autocomplete results');
+    return successResponse(res, formatted, 'Quick search autocomplete results');
   } catch (error) {
     next(error);
   }

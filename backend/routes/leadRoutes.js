@@ -77,14 +77,13 @@ router.route('/:id')
 // 5. Update Status Only Endpoint
 router.patch(
   '/:id/status',
-  [
+  validate([
     body('status')
       .notEmpty()
       .withMessage('Status is required')
       .isIn(['New', 'Contacted', 'Meeting Scheduled', 'Proposal Sent', 'Won', 'Lost'])
       .withMessage('Status must be a valid enum value'),
-  ],
-  validate([]), // We don't have separate rule checks besides body, but this ensures custom validation checks run
+  ]),
   updateLeadStatus
 );
 

@@ -1,48 +1,31 @@
-import { errorResponse } from '../utils/apiResponse.js';
-
 /**
- * Global Express error handling middleware.
+ * Global Express error handling middleware for Prisma + JWT + API errors.
  */
 export const errorHandler = (err, req, res, next) => {
   let statusCode = err.statusCode || 500;
   let message = err.message || 'Server error';
   let errors = null;
 
-  // Clone details for development inspection
-  const errorObj = { ...err };
-  errorObj.message = err.message;
-  errorObj.stack = err.stack;
-
-  // 1. Mongoose Validation Error (validation fails on schema level)
-  if (err.name === 'ValidationError') {
-    statusCode = 400;
-    message = 'Validation failed';
-    errors = Object.keys(err.errors).map((key) => ({
-      field: key,
-      message: err.errors[key].message,
-    }));
-  }
-
-  // 2. Mongoose Cast Error (invalid ObjectId formatting)
-  else if (err.name === 'CastError') {
+  // 1. Prisma Known Request Errors (unique constraints, not found, foreign keys)
+  if (err.code === 'P2002') {
+    statusCode = 409;
+    const target = Array.isArray(err.meta?.target)
+      ? err.meta.target[0]
+      : err.meta?.target || 'field';
+    const label = String(target).charAt(0).toUpperCase() + String(target).slice(1);
+    message = `${label} already exists`;
+    errors = [{ field: String(target), message: `${label} is already registered` }];
+  } else if (err.code === 'P2025') {
     statusCode = 404;
     message = 'Resource not found';
+  } else if (err.code === 'P2003') {
+    statusCode = 400;
+    message = 'Invalid reference provided';
+  } else if (err.name === 'PrismaClientValidationError') {
+    statusCode = 400;
+    message = 'Invalid request data';
   }
-
-  // 3. MongoDB Duplicate Key Error (e.g. duplicate email registration)
-  else if (err.code === 11000) {
-    statusCode = 409;
-    const duplicatedField = Object.keys(err.keyValue || {})[0] || 'field';
-    message = `${duplicatedField.charAt(0).toUpperCase() + duplicatedField.slice(1)} already exists`;
-    errors = [
-      {
-        field: duplicatedField,
-        message: `${duplicatedField.charAt(0).toUpperCase() + duplicatedField.slice(1)} is already registered`,
-      },
-    ];
-  }
-
-  // 4. JWT Validation Errors
+  // 2. JWT Validation Errors
   else if (err.name === 'JsonWebTokenError') {
     statusCode = 401;
     message = 'Token is invalid';
@@ -50,8 +33,11 @@ export const errorHandler = (err, req, res, next) => {
     statusCode = 401;
     message = 'Token has expired, please login again';
   }
+  // 3. CORS / explicit HTTP errors
+  else if (err.message === 'Not allowed by CORS') {
+    statusCode = 403;
+  }
 
-  // Log server errors for debugging in development
   if (process.env.NODE_ENV === 'development') {
     console.error('Error Intercepted by Global Handler:', err);
     return res.status(statusCode).json({
@@ -62,7 +48,6 @@ export const errorHandler = (err, req, res, next) => {
     });
   }
 
-  // Production response (no stack trace)
   return res.status(statusCode).json({
     success: false,
     message,

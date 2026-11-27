@@ -1,6 +1,7 @@
 import jwt from 'jsonwebtoken';
-import User from '../models/User.js';
+import prisma from '../config/database.js';
 import { errorResponse } from '../utils/apiResponse.js';
+import { formatUser } from '../utils/crmEnums.js';
 
 /**
  * Middleware to protect routes by validating incoming JWT in Authorization header.
@@ -8,7 +9,6 @@ import { errorResponse } from '../utils/apiResponse.js';
 export const protect = async (req, res, next) => {
   let token;
 
-  // 1. Check for Authorization header starting with 'Bearer'
   if (
     req.headers.authorization &&
     req.headers.authorization.startsWith('Bearer')
@@ -16,23 +16,26 @@ export const protect = async (req, res, next) => {
     token = req.headers.authorization.split(' ')[1];
   }
 
-  // 2. Return error if token is missing
   if (!token) {
     return errorResponse(res, 'No token provided, access denied', 401);
   }
 
   try {
-    // 3. Verify the token
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
 
-    // 4. Find the user associated with the token (excluding password)
-    const user = await User.findById(decoded.id).select('-password');
+    const user = await prisma.user.findUnique({
+      where: { id: decoded.id },
+    });
+
     if (!user) {
       return errorResponse(res, 'User belonging to this token no longer exists', 401);
     }
 
-    // 5. Attach user to request object
-    req.user = user;
+    if (!user.isActive) {
+      return errorResponse(res, 'Account is deactivated', 403);
+    }
+
+    req.user = formatUser(user);
     next();
   } catch (error) {
     if (error.name === 'TokenExpiredError') {
@@ -43,4 +46,27 @@ export const protect = async (req, res, next) => {
     }
     return errorResponse(res, 'Not authorized to access this route', 401);
   }
+};
+
+/**
+ * Role-based authorization middleware.
+ * Accepts lowercase role names matching formatUser() output ('admin', 'manager', 'user').
+ *
+ * @param  {...string} roles
+ */
+export const authorize = (...roles) => {
+  const allowed = roles.map((r) => String(r).toLowerCase());
+  return (req, res, next) => {
+    if (!req.user) {
+      return errorResponse(res, 'Not authorized to access this route', 401);
+    }
+    if (!allowed.includes(String(req.user.role || '').toLowerCase())) {
+      return errorResponse(
+        res,
+        `Role '${req.user.role}' is not authorized to access this resource`,
+        403
+      );
+    }
+    next();
+  };
 };
